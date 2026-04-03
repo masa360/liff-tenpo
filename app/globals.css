@@ -1,0 +1,16 @@
+@import 'tailwindcss';
+
+:root {
+  --bg-base: #f6f3ee;
+  --bg-card: #fffefb;
+  --tx-primary: #2c1a0e;
+  --tx-secondary: #6b5a4d;
+  --ac-base: #b5714a;
+  --ac-light: #f0e4d8;
+  --bd-base: #e5dcd2;
+}
+
+body {
+  background: var(--bg-base);
+  color: var(--tx-primary);
+}
