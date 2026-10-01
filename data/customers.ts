@@ -1,7 +1,7 @@
 import type { StoreMenu } from './menus';
 import type { StoreStaff } from './staff';
 
-/** 来店者（ダミー）。本番は GAS / スプレッドシート等から取得に差し替え */
+/** 来店者。GAS 取得失敗時のみフォールバックとして `storeCustomers` を使う */
 export interface StoreCustomer {
   id: string;
   /** 画面上の氏名 */

@@ -1,19 +1,28 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { storeCustomers, type StoreCustomer } from '@/data/customers';
 import { storeMenus } from '@/data/menus';
-import { storeStaffList } from '@/data/staff';
+import { storeStaffList as fallbackStoreStaffList, type StoreStaff } from '@/data/staff';
 import { rankCustomersForPredict } from '@/lib/customerMatch';
 import { sortCustomersForStoreUi } from '@/lib/customerSort';
-import { createReservationOnGas } from '@/lib/reservationApi';
+import { gasRowsToStoreCustomers } from '@/lib/gasCustomers';
+import {
+  cancelReservation,
+  createReservationOnGas,
+  fetchStaffFromGas,
+  fetchStoreCustomersFromGas,
+  getCancellableReservations,
+  registerStoreCustomerOnGas,
+  type CancellableReservation,
+} from '@/lib/reservationApi';
 import { buildTimeSlots } from '@/lib/timeSlots';
 
-type Step = 'customer' | 'repeat_choice' | 'menu' | 'datetime' | 'confirm';
+type Step = 'customer' | 'repeat_choice' | 'menu' | 'datetime' | 'confirm' | 'cancel_select' | 'cancel_confirm';
 
-/** ステップバー用（repeat_choice は「お客様」段階に含める） */
+/** ステップバー用（repeat_choice とキャンセルモードは「お客様」段階に含める） */
 function toProgressStep(s: Step): 'customer' | 'menu' | 'datetime' | 'confirm' {
-  if (s === 'repeat_choice') return 'customer';
+  if (s === 'repeat_choice' || s === 'cancel_select' || s === 'cancel_confirm') return 'customer';
   return s;
 }
 
@@ -36,6 +45,11 @@ function formatLastVisitLine(c: StoreCustomer): string | null {
 export default function StoreBookingWizard() {
   const [step, setStep] = useState<Step>('customer');
   const [kanaInput, setKanaInput] = useState('');
+  /** GAS の StoreCustomers 由来（取得失敗時はダミー `storeCustomers` のまま） */
+  const [customers, setCustomers] = useState<StoreCustomer[]>(storeCustomers);
+  /** GAS の「スタッフ設定」シート由来（取得失敗時はダミーのまま） */
+  const [storeStaffList, setStoreStaffList] = useState<StoreStaff[]>(fallbackStoreStaffList);
+  const [customersBusy, setCustomersBusy] = useState(false);
   const [customer, setCustomer] = useState<StoreCustomer | null>(null);
   const [isNewCustomer, setIsNewCustomer] = useState(false);
   const [newDisplayName, setNewDisplayName] = useState('');
@@ -47,10 +61,61 @@ export default function StoreBookingWizard() {
   const [submitting, setSubmitting] = useState(false);
   const [resultMsg, setResultMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
+  // キャンセルモード関連
+  const [mode, setMode] = useState<'book' | 'cancel'>('book');
+  const [cancelReservations, setCancelReservations] = useState<CancellableReservation[]>([]);
+  const [cancelLoading, setCancelLoading] = useState(false);
+  const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+
+  const reloadCustomersFromGas = useCallback(async (opts?: { showToast?: boolean }) => {
+    setCustomersBusy(true);
+    const r = await fetchStoreCustomersFromGas();
+    setCustomersBusy(false);
+    if (r.ok) {
+      setCustomers(gasRowsToStoreCustomers(r.customers, storeMenus, storeStaffList));
+      if (opts?.showToast) {
+        setResultMsg({ ok: true, text: '顧客一覧をスプレッドシートから更新しました。' });
+      }
+      return true;
+    }
+    if (opts?.showToast) {
+      setResultMsg({
+        ok: false,
+        text: r.error || '顧客一覧の取得に失敗しました（オフラインのダミー一覧を表示中）。',
+      });
+    }
+    return false;
+  }, [storeStaffList]);
+
+  useEffect(() => {
+    void reloadCustomersFromGas();
+  }, [reloadCustomersFromGas]);
+
+  // 初回マウントでスタッフ設定をGASから取得（失敗時はフォールバックのまま）
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const r = await fetchStaffFromGas();
+      if (!alive) return;
+      if (r.ok && r.staff.length > 0) {
+        setStoreStaffList(
+          r.staff
+            .slice()
+            .sort((a, b) => Number(a.order) - Number(b.order))
+            .map((s) => ({ id: s.id, name: s.name || s.id })),
+        );
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   const inputTrim = kanaInput.trim();
   const { repeatersFirst, othersFirst, searchRanked } = useMemo(() => {
     if (!inputTrim) {
-      const sorted = sortCustomersForStoreUi(storeCustomers);
+      const sorted = sortCustomersForStoreUi(customers);
       return {
         repeatersFirst: sorted.filter((c) => !!c.lastReservation),
         othersFirst: sorted.filter((c) => !c.lastReservation),
@@ -60,9 +125,9 @@ export default function StoreBookingWizard() {
     return {
       repeatersFirst: [] as StoreCustomer[],
       othersFirst: [] as StoreCustomer[],
-      searchRanked: rankCustomersForPredict(kanaInput, storeCustomers),
+      searchRanked: rankCustomersForPredict(kanaInput, customers),
     };
-  }, [inputTrim, kanaInput]);
+  }, [inputTrim, kanaInput, customers]);
 
   const predictTop = useMemo(
     () => (searchRanked ? searchRanked.slice(0, 8) : []),
@@ -75,7 +140,7 @@ export default function StoreBookingWizard() {
   );
   const selectedStaff = useMemo(
     () => storeStaffList.find((s) => s.id === staffId) ?? null,
-    [staffId],
+    [staffId, storeStaffList],
   );
 
   const timeSlots = useMemo(() => buildTimeSlots(), []);
@@ -92,6 +157,9 @@ export default function StoreBookingWizard() {
     setDate(todayYmd());
     setTime(null);
     setResultMsg(null);
+    setMode('book');
+    setCancelReservations([]);
+    setSelectedEventId(null);
   }
 
   function pickCustomer(c: StoreCustomer) {
@@ -102,6 +170,27 @@ export default function StoreBookingWizard() {
     setUseLastContent(null);
     setMenuId(null);
     setStaffId('staff-00');
+
+    if (mode === 'cancel') {
+      setCancelLoading(true);
+      void getCancellableReservations({
+        customerId: c.id,
+        displayName: c.displayName,
+      })
+        .then((list) => {
+          setCancelReservations(list);
+          setStep('cancel_select');
+        })
+        .catch(() => {
+          setCancelReservations([]);
+          setStep('cancel_select');
+        })
+        .finally(() => {
+          setCancelLoading(false);
+        });
+      return;
+    }
+
     if (c.lastReservation) {
       setStep('repeat_choice');
     } else {
@@ -174,7 +263,24 @@ export default function StoreBookingWizard() {
 
     setSubmitting(true);
     setResultMsg(null);
-    const cid = customer?.id ?? 'new';
+
+    let gasCustomerId: string | undefined;
+    if (isNewCustomer) {
+      const reg = await registerStoreCustomerOnGas({
+        displayName,
+        searchKana: displayName,
+      });
+      if (!reg.success || !reg.customerId) {
+        setSubmitting(false);
+        setResultMsg({ ok: false, text: reg.error ?? '新規顧客の登録に失敗しました。' });
+        return;
+      }
+      gasCustomerId = reg.customerId;
+    } else if (customer?.id) {
+      gasCustomerId = customer.id;
+    }
+
+    const cid = gasCustomerId ?? customer?.id ?? 'new';
     const notes = [
       '店舗端末 store-booking',
       `顧客ID:${cid}`,
@@ -194,10 +300,12 @@ export default function StoreBookingWizard() {
       date,
       time,
       notes,
+      customerId: gasCustomerId,
     });
 
     setSubmitting(false);
     if (res.success) {
+      void reloadCustomersFromGas();
       setResultMsg({
         ok: true,
         text: `登録しました。${res.eventId ? `イベントID: ${res.eventId}` : ''}`,
@@ -251,6 +359,22 @@ export default function StoreBookingWizard() {
   function backFromConfirm() {
     setResultMsg(null);
     setStep('datetime');
+  }
+
+  async function submitCancel(eventId: string) {
+    setCancelling(true);
+    try {
+      await cancelReservation(eventId);
+      window.alert('キャンセルが完了しました');
+      void reloadCustomersFromGas();
+      resetAll();
+    } catch (err) {
+      window.alert(
+        err instanceof Error ? err.message : 'キャンセルに失敗しました。もう一度お試しください',
+      );
+    } finally {
+      setCancelling(false);
+    }
   }
 
   return (
@@ -307,7 +431,43 @@ export default function StoreBookingWizard() {
 
       {step === 'customer' ? (
         <section className="space-y-4 rounded-2xl border border-[var(--bd-base)] bg-[var(--bg-card)] p-4 shadow-sm">
-          <h2 className="text-sm font-bold">お客様を選ぶ</h2>
+          {/* モード切替ボタン */}
+          <div className="flex gap-2 border-b border-[var(--bd-base)] pb-4">
+            <button
+              type="button"
+              onClick={() => setMode('book')}
+              className={`flex-1 rounded-lg py-2 text-sm font-bold transition ${
+                mode === 'book'
+                  ? 'bg-[var(--ac-base)] text-white'
+                  : 'bg-stone-100 text-stone-700 hover:bg-stone-200'
+              }`}
+            >
+              予約する
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode('cancel')}
+              className={`flex-1 rounded-lg py-2 text-sm font-bold transition ${
+                mode === 'cancel'
+                  ? 'bg-red-500 text-white'
+                  : 'bg-stone-100 text-stone-700 hover:bg-stone-200'
+              }`}
+            >
+              キャンセルする
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-sm font-bold">お客様を選ぶ</h2>
+            <button
+              type="button"
+              disabled={customersBusy}
+              onClick={() => void reloadCustomersFromGas({ showToast: true })}
+              className="shrink-0 rounded-lg border border-[var(--bd-base)] px-2 py-1 text-xs font-medium text-[var(--ac-base)] disabled:opacity-50"
+            >
+              {customersBusy ? '更新中…' : '一覧を更新'}
+            </button>
+          </div>
           <div className="relative space-y-1">
             <span className="block text-xs text-[var(--tx-secondary)]">
               名前・ヨミを入力すると<strong className="text-[var(--tx-primary)]">下に予測候補</strong>
@@ -685,6 +845,110 @@ export default function StoreBookingWizard() {
           >
             {submitting ? '登録中…' : '予約を登録する'}
           </button>
+        </section>
+      ) : null}
+
+      {/* キャンセルモード: 予約選択 */}
+      {step === 'cancel_select' && customer ? (
+        <section className="space-y-4 rounded-2xl border border-[var(--bd-base)] bg-[var(--bg-card)] p-4 shadow-sm">
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-sm font-bold">
+              {customer.displayName} のキャンセル対象
+            </h2>
+            <button
+              type="button"
+              onClick={() => {
+                setCustomer(null);
+                setStep('customer');
+              }}
+              className="text-xs text-[var(--ac-base)]"
+            >
+              戻る
+            </button>
+          </div>
+
+          {cancelLoading ? (
+            <p className="text-center text-sm text-[var(--tx-secondary)]">予約一覧を読み込み中…</p>
+          ) : cancelReservations.length === 0 ? (
+            <p className="rounded-lg bg-amber-50 px-3 py-3 text-center text-sm text-amber-900">
+              キャンセル可能な予約がありません。
+            </p>
+          ) : (
+            <ul className="space-y-2">
+              {cancelReservations.map((r) => (
+                <li key={r.eventId}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedEventId(r.eventId);
+                      setStep('cancel_confirm');
+                    }}
+                    className="w-full rounded-xl border border-[var(--bd-base)] bg-white px-4 py-4 text-left transition hover:border-red-400 hover:bg-red-50 active:scale-[0.99]"
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex-1">
+                        <p className="font-semibold text-[var(--tx-primary)]">
+                          {r.date} {r.time}
+                        </p>
+                        <p className="text-sm text-[var(--tx-secondary)]">{r.menuName}</p>
+                      </div>
+                      <span className="text-xs font-medium text-[var(--tx-secondary)]">
+                        {r.staffId === 'staff-00'
+                          ? '指名なし'
+                          : storeStaffList.find((s) => s.id === r.staffId)?.name || r.staffId}
+                      </span>
+                    </div>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      ) : null}
+
+      {/* キャンセルモード: 確認 */}
+      {step === 'cancel_confirm' && selectedEventId ? (
+        <section className="space-y-4 rounded-2xl border border-[var(--bd-base)] bg-[var(--bg-card)] p-4 shadow-sm">
+          <h2 className="text-sm font-bold">キャンセル確認</h2>
+          {(() => {
+            const reservation = cancelReservations.find((r) => r.eventId === selectedEventId);
+            return reservation ? (
+              <div className="rounded-xl bg-red-50 px-4 py-4 text-sm">
+                <div className="mb-2 flex items-center justify-between">
+                  <span className="text-xs font-bold text-red-700 uppercase">キャンセル対象</span>
+                </div>
+                <p className="font-semibold text-[var(--tx-primary)]">
+                  {reservation.date} {reservation.time}
+                </p>
+                <p className="mt-1 text-[var(--tx-secondary)]">{reservation.menuName}</p>
+                <p className="mt-1 text-xs text-[var(--tx-secondary)]">
+                  {storeStaffList.find((s) => s.id === reservation.staffId)?.name ||
+                    reservation.staffId}
+                </p>
+              </div>
+            ) : null;
+          })()}
+
+          <div className="grid gap-3">
+            <button
+              type="button"
+              disabled={cancelling}
+              onClick={() => selectedEventId && void submitCancel(selectedEventId)}
+              className="rounded-2xl bg-red-500 py-5 text-base font-bold leading-tight text-white shadow-sm active:opacity-90 disabled:opacity-50"
+            >
+              {cancelling ? '処理中…' : 'キャンセルを確定する'}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedEventId(null);
+                setStep('cancel_select');
+              }}
+              className="py-2 text-sm text-[var(--tx-secondary)] underline"
+            >
+              ← 予約選択に戻る
+            </button>
+          </div>
         </section>
       ) : null}
     </div>

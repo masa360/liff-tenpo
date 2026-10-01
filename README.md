@@ -1,4 +1,8 @@
-# store-booking（店舗用予約入力）
+# store-booking（店舗用予約入力・Next.js 版）
+
+> ⚠️ **これはオプションの見本です（2026-10-02 方針）。** 店舗用画面の標準は、GAS の HTML 版
+> `reserve-liff/gas/reservation-only-user-and-store-v4/StoreBookingPage.html`（店舗用GASに貼るだけ・リポジトリと Vercel 不要）。
+> 顧客ごとにこのアプリを複製しない。見た目を作り込みたい顧客だけ、個別見積でここから作る。
 
 リポジトリ直下の **親アプリ（LIFF 予約）とは別フォルダ**の Next.js アプリです。  
 タブレット／店頭ブラウザで、**電話・対面予約**をサクサク入れることだけに絞っています。
@@ -9,13 +13,13 @@
 2. **前回どうする**（リピーターのみ）— 特大ボタンで **「前回と同じ → 日時だけ」** か **「メニュー・担当を変える」**。
 3. **メニュー・担当** — 単一リスト（変更ルート・新規・初回来店のみ通る）
 4. **日時** — 「前回と同じ」のときは画面上部に **コース内容の固定表示**、時刻ボタンはタップしやすい大きさ
-5. **確認 → GAS 登録** — 親 LIFF と同じ `createReservation`（共有 GAS・カレンダー）
+5. **確認 → GAS 登録** — 店舗用GAS（`gas/reservation-only-user-and-store-v4/Code.store.gs` をデプロイした URL）の `createReservation` 等（共有カレンダー推奨）
 
 ## リピーター設計の意図
 
 - **電話対応の「いつもので」**を最短タップに寄せる（メニュー画面をスキップ可能）。
 - **混線防止**は GAS 側のカレンダーが正。フロントは複雑にしない。
-- 本番では `data/customers.ts` をやめ、**GAS が「ヨミ検索 + 前回メニュー」**を返す形に差し替える。
+- 本番は GAS の **`listStoreCustomers`** で取得（失敗時のみ `data/customers.ts` フォールバック）。詳細は `gas/README.md` と `docs/GAS連携設計_店舗予約.md`。
 
 マップ・店舗情報カード等は **ありません**。
 
@@ -33,11 +37,15 @@ npm run dev
 
 `.env.example` を参考に `store-booking/.env.local` を作成。
 
-- `GAS_WEBAPP_URL` — 親プロジェクトと **同じ** GAS ウェブアプリ URL でよい（`action: createReservation`）
+- `GAS_WEBAPP_URL` — **`gas/reservation-only-user-and-store/Code.gs` を貼り付けた GAS** の `/exec` URL（親 LIFF も **同じ予約専用 GAS** に揃えるとカレンダー共有が簡単）
 
-## データの置き場所（今後）
+## GAS 正本
 
-- 顧客マスタ・前回予約: いまは `data/customers.ts` のダミー。本番は GAS で検索 API を足す想定。
+- **`gas/reservation-only-user-and-store/Code.gs`** — この内容を Google の「コード.gs」に貼り付け。説明は **`store-booking/gas/README.md`**。
+
+## データの置き場所
+
+- 顧客マスタ・前回予約: GAS（`listStoreCustomers`）＋スプレッドシート。オフライン時のみ `data/customers.ts`。
 - メニュー・スタッフ: `data/menus.ts` / `data/staff.ts` を店舗に合わせて編集、または GAS から取得に差し替え。
 
 ## LIFF について
